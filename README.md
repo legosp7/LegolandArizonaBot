@@ -77,6 +77,7 @@ All deadlines and responses are stored in the database and active voting/rating 
 
 - `/recommend restaurant` — add a recommendation during the open window (voter role).
 - `/remove` — select one of your recommendations to remove.
+- `/recommendations` — view every active restaurant in the voting pool and its recommender, 10 per page.
 - `/list [num]` — show 1–25 top scored visits (default 10).
 - `/userscores` — rank all nominators by average result, 10 per page.
 - `/user user` — show a member’s active recommendations and score history.

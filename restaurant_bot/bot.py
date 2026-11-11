@@ -494,6 +494,38 @@ class EmbedPages(discord.ui.View):
         await interaction.response.edit_message(embed=self.pages[self.index], view=self)
 
 
+@bot.tree.command(name="recommendations", description="View all restaurants currently in the voting pool")
+async def active_recommendations(interaction: discord.Interaction) -> None:
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    async with bot.sessions() as session:
+        rows = (await session.execute(
+            select(Recommendation, User)
+            .join(User, User.id == Recommendation.recommender_id)
+            .where(Recommendation.guild_id == interaction.guild_id)
+            .order_by(Recommendation.name)
+        )).all()
+    chunks = [rows[i:i + 10] for i in range(0, len(rows), 10)] or [[]]
+    pages: list[discord.Embed] = []
+    for page_number, chunk in enumerate(chunks, 1):
+        embed = discord.Embed(title="Active Restaurant Recommendations", color=discord.Color.blurple())
+        if chunk:
+            offset = (page_number - 1) * 10
+            embed.description = "\n\n".join(
+                f"**{offset + index}. {recommendation.name}**\nRecommended by **{user.display_name}**"
+                for index, (recommendation, user) in enumerate(chunk, 1)
+            )
+        else:
+            embed.description = "There are no active restaurant recommendations."
+        embed.set_footer(text=f"Page {page_number}/{len(chunks)} · {len(rows)} active recommendation{'s' if len(rows) != 1 else ''}")
+        pages.append(embed)
+    if len(pages) > 1:
+        await interaction.response.send_message(embed=pages[0], view=EmbedPages(pages, interaction.user.id))
+    else:
+        await interaction.response.send_message(embed=pages[0])
+
+
 @bot.tree.command(description="View average restaurant scores grouped by recommender")
 async def userscores(interaction: discord.Interaction) -> None:
     if not interaction.guild_id:
