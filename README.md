@@ -29,7 +29,38 @@ The bot needs the `bot` and `applications.commands` OAuth scopes plus View Chann
 - `BOT_TIMEZONE` and `MONDAY_HOUR`: local weekly opening time.
 - `EVENT_DAY`, `EVENT_HOUR`, `EVENT_MINUTE`, and `EVENT_LOCATION`: scheduled-event defaults. Monday is day `0`; Friday is day `4`. For example, `EVENT_HOUR=18` and `EVENT_MINUTE=30` means 6:30 PM.
 
-`DATABASE_URL` defaults to `sqlite+aiosqlite:///restaurant_bot.db`. PostgreSQL is still possible, but install a database driver that publishes a wheel for your exact Python version and use its matching SQLAlchemy URL.
+`DB_PATH` defaults to `bot.db`. If `DB_PATH` is set, it takes priority over `DATABASE_URL`. PostgreSQL remains possible through `DATABASE_URL` when `DB_PATH` is unset, but its matching async driver must be installed separately.
+
+## Docker on Raspberry Pi
+
+The included Compose configuration stores SQLite outside the container at `./data/bot.db`. Inside the container, the same file is available as `/app/data/bot.db` through `DB_PATH`.
+
+On the Pi:
+
+```bash
+cd /mnt/server-data/docker-apps/discord-bots/YOUR-REPO
+findmnt /mnt/server-data
+mkdir -p data
+cp .env.example .env
+# Edit .env with the Discord IDs and token, then start the bot.
+docker compose up -d --build
+```
+
+The resulting storage path is:
+
+```text
+/mnt/server-data/docker-apps/discord-bots/YOUR-REPO/data/bot.db
+```
+
+Useful commands:
+
+```bash
+docker compose logs -f restaurant-bot
+docker compose restart restaurant-bot
+docker compose down
+```
+
+`docker compose down` does not delete `data/bot.db`. Avoid `docker compose down -v` if the volume configuration is changed to a named volume later.
 
 ## Weekly flow
 

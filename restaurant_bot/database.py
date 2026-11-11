@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -83,7 +85,19 @@ class RestaurantResult(Base):
 
 
 def create_session_factory(database_url: str | None = None) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
-    url = database_url or os.getenv("DATABASE_URL", "sqlite+aiosqlite:///restaurant_bot.db")
+    configured_path = os.getenv("DB_PATH", "").strip()
+    configured_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        url: str | URL = database_url
+    elif configured_path:
+        db_path = Path(configured_path).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        url = URL.create("sqlite+aiosqlite", database=str(db_path))
+    elif configured_url:
+        url = configured_url
+    else:
+        db_path = Path("bot.db")
+        url = URL.create("sqlite+aiosqlite", database=str(db_path))
     engine = create_async_engine(url, pool_pre_ping=True)
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 
