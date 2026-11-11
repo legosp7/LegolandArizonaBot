@@ -1,75 +1,59 @@
-# Restaurant Review Discord Bot
+# Weekly Restaurant Discord Bot
 
-A Python Discord bot that posts restaurant review requests as rich embeds. The nominated reviewer chooses a **1–10 rating** from a dropdown and is then shown a text box for an optional note. Requests remain interactive for 24 hours by default, or for the duration supplied to the command. PostgreSQL stores users, restaurants, review invitations, ratings, and notes through SQLAlchemy.
+A persistent Discord bot for weekly restaurant recommendations, approval voting, events, ratings, and leaderboards.
 
-## Requirements
+## Install
 
-- Python 3.11+
-- PostgreSQL 14+
-- A Discord application with a bot user
+Python 3.11–3.13 is recommended. The default database is SQLite, using `aiosqlite`; it does not compile `asyncpg` and therefore avoids the “Failed to build installable wheels … asyncpg” error.
 
-## Discord setup
-
-1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), open **Bot**, and create a bot token.
-2. Under **OAuth2 → URL Generator**, select the `bot` and `applications.commands` scopes. Give the bot **View Channels**, **Send Messages**, **Embed Links**, and **Read Message History** permissions, then use the generated URL to invite it.
-3. Never commit or share the bot token.
-
-## Run locally
-
-Create the database (adjust the owner/password as desired):
-
-```bash
-createdb restaurant_reviews
+```powershell
+py -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Create a virtual environment and install dependencies:
+Edit `.env`, then run:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
-python -m pip install -r requirements.txt
+```powershell
+.venv\Scripts\python -m restaurant_bot.bot
 ```
 
-Copy the sample configuration and edit it:
+The bot needs the `bot` and `applications.commands` OAuth scopes plus View Channels, Send Messages, Embed Links, Read Message History, and Manage Events permissions. Set `DISCORD_GUILD_ID` during development for immediate slash-command updates.
 
-```bash
-cp .env.example .env
-```
+## Required configuration
 
-```dotenv
-DISCORD_TOKEN=your-token
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/restaurant_reviews
-DISCORD_GUILD_ID=your-test-server-id
-```
+- `DISCORD_TOKEN`: bot token.
+- `VOTER_ROLE_ID`: the role allowed to recommend, vote, and rate. It is deliberately blank in the example.
+- `ANNOUNCEMENT_CHANNEL_ID`: channel for the first automatic Monday post. Later weeks can reuse the most recently stored channel.
+- `BOT_TIMEZONE` and `MONDAY_HOUR`: local weekly opening time.
+- `EVENT_DAY`, `EVENT_HOUR`, and `EVENT_LOCATION`: scheduled-event defaults. Monday is day `0`; Friday is day `4`.
 
-`DISCORD_GUILD_ID` is optional but recommended during development because commands registered to a test server appear immediately. If omitted, the command is registered globally and Discord may take time to display it. Database tables are created automatically at startup.
+`DATABASE_URL` defaults to `sqlite+aiosqlite:///restaurant_bot.db`. PostgreSQL is still possible, but install a database driver that publishes a wheel for your exact Python version and use its matching SQLAlchemy URL.
 
-Start the bot:
+## Weekly flow
 
-```bash
-python -m restaurant_bot.bot
-```
+1. On Monday, a 24-hour recommendation window opens and pings the configured role.
+2. Eligible users use `/recommend restaurant`; each may keep up to two active entries. `/remove` opens a private selection menu.
+3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool (Discord component limit: 25).
+4. The winner is announced, an external Discord event is created, and the winning recommendation waits for Friday.
+5. An administrator runs `/rate` on or after Friday. The role receives a 1–10 selector for 24 hours.
+6. The bot averages and announces the score and nominator, stores the result, and removes only the winning restaurant. All other recommendations carry into the next week.
 
-## Usage
+All deadlines and responses are stored in the database and active voting/rating controls are restored after a restart.
 
-In Discord, enter:
+## Commands
 
-```text
-/request-review user:@Alex restaurant:Brickolini's hours:24
-```
+- `/recommend restaurant` — add a recommendation during the open window (voter role).
+- `/remove` — select one of your recommendations to remove.
+- `/list [num]` — show 1–25 top scored visits (default 10).
+- `/userscores` — rank all nominators by average result, 10 per page.
+- `/user user` — show a member’s active recommendations and score history.
+- `/rate` — start the post-Friday rating window (administrator).
+- `/skip` — stop the current weekly cycle (administrator).
+- `/add user restaurant score` — store a manual historical score (administrator).
+- `/forceadd restaurant user` — add a restaurant to the voting pool for a user without applying the per-user or pool-size limits (administrator).
+- `/force-open phase [minutes] [restaurant]` — immediately open recommendations, voting, or rating for debugging. Test periods default to five minutes; forced rating uses the oldest queued restaurant unless one is named (administrator).
+- `/force-clear confirm:CLEAR` — permanently delete all bot data and disable active vote/rating components (administrator).
 
-- `user` and `restaurant` are required.
-- `hours` is optional, defaults to `24`, and accepts 1–168.
-- Only the nominated user can submit that request. Selecting a rating opens the note dialog.
-- Submitting again before expiry updates that user's existing review rather than creating a duplicate.
-- On restart, the bot reconnects still-active controls whose message is still accessible.
-
-## Database schema
-
-SQLAlchemy creates four tables: `users` (Discord identity and the user's review relationship), `restaurants`, `invitations` (message IDs and expiry), and `reviews` (reviewer, restaurant, rating, note, and timestamp). For production schema changes, add a migration tool such as Alembic instead of relying only on `create_all`.
-
-## Troubleshooting
-
-- **Command not visible:** set `DISCORD_GUILD_ID`, restart, and confirm the bot was invited with `applications.commands`.
-- **Database connection errors:** confirm PostgreSQL is running, the database exists, and `DATABASE_URL` uses the `postgresql+asyncpg://` prefix.
-- **Old request does not restore:** the bot needs View Channel and Read Message History access to the original channel.
+Normal recommendations stop at 25 active restaurants, but administrator force-added entries are unlimited. Voting automatically paginates them into groups of 25 and saves choices independently on each page. Ratings are upserts, and voting again on a page replaces that user's choices on that page.
