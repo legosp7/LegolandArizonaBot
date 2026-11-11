@@ -27,7 +27,7 @@ The bot needs the `bot` and `applications.commands` OAuth scopes plus View Chann
 - `VOTER_ROLE_ID`: the role allowed to recommend, vote, and rate. It is deliberately blank in the example.
 - `ANNOUNCEMENT_CHANNEL_ID`: channel for the first automatic Monday post. Later weeks can reuse the most recently stored channel.
 - `BOT_TIMEZONE` and `MONDAY_HOUR`: local weekly opening time.
-- `EVENT_DAY`, `EVENT_HOUR`, and `EVENT_LOCATION`: scheduled-event defaults. Monday is day `0`; Friday is day `4`.
+- `EVENT_DAY`, `EVENT_HOUR`, `EVENT_MINUTE`, and `EVENT_LOCATION`: scheduled-event defaults. Monday is day `0`; Friday is day `4`. For example, `EVENT_HOUR=18` and `EVENT_MINUTE=30` means 6:30 PM.
 
 `DATABASE_URL` defaults to `sqlite+aiosqlite:///restaurant_bot.db`. PostgreSQL is still possible, but install a database driver that publishes a wheel for your exact Python version and use its matching SQLAlchemy URL.
 

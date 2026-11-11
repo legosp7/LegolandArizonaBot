@@ -338,9 +338,11 @@ class RestaurantBot(discord.Client):
         local = datetime.now(self.tz)
         day = int(os.getenv("EVENT_DAY", "4"))
         days = (day - local.weekday()) % 7
-        if days == 0 and local.hour >= int(os.getenv("EVENT_HOUR", "18")):
+        event_hour = int(os.getenv("EVENT_HOUR", "18"))
+        event_minute = int(os.getenv("EVENT_MINUTE", "0"))
+        if days == 0 and (local.hour, local.minute) >= (event_hour, event_minute):
             days = 7
-        start_local = (local + timedelta(days=days)).replace(hour=int(os.getenv("EVENT_HOUR", "18")), minute=0, second=0, microsecond=0)
+        start_local = (local + timedelta(days=days)).replace(hour=event_hour, minute=event_minute, second=0, microsecond=0)
         try:
             event = await guild.create_scheduled_event(name=f"Fat Friday @ {restaurant}"[:100], description=f"This week's winning restaurant: {restaurant}", start_time=start_local.astimezone(UTC), end_time=(start_local + timedelta(hours=2)).astimezone(UTC), entity_type=discord.EntityType.external, privacy_level=discord.PrivacyLevel.guild_only, location=os.getenv("EVENT_LOCATION", restaurant))
             return f" Event created: {event.url}"
