@@ -1,0 +1,2 @@
+"""Discord restaurant review bot."""
+
