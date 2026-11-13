@@ -66,7 +66,7 @@ docker compose down
 
 1. On Monday, a 24-hour recommendation window opens and pings the configured role.
 2. Eligible users use `/recommend restaurant`; each may keep up to two active entries. `/remove` opens a private selection menu.
-3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool (Discord component limit: 25).
+3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool. Its attached embed shows a live per-restaurant vote tally and refreshes after every ballot (25 restaurants per page).
 4. The winner is announced, an external Discord event is created, and the winning recommendation waits for Friday.
 5. An administrator runs `/rate` on or after Friday. The role receives a 1–10 selector for 24 hours.
 6. The bot averages and announces the score and nominator, stores the result, and removes only the winning restaurant. All other recommendations carry into the next week.
@@ -78,11 +78,14 @@ All deadlines and responses are stored in the database and active voting/rating 
 - `/recommend restaurant` — add a recommendation during the open window (voter role).
 - `/remove` — select one of your recommendations to remove.
 - `/recommendations` — view every active restaurant in the voting pool and its recommender, 10 per page.
+- `/viewballot` — view a paginated snapshot of the currently active vote tally; run it again to refresh.
 - `/list [num]` — show 1–25 top scored visits (default 10).
 - `/userscores` — rank all nominators by average result, 10 per page.
 - `/user user` — show a member’s active recommendations and score history.
 - `/rate` — start the post-Friday rating window (administrator).
 - `/skip` — stop the current weekly cycle (administrator).
+- `/end-process` — immediately end the current phase: recommendations advance to voting, voting selects its winner, and rating calculates its result (administrator).
+- `/admin-remove user restaurant` — remove a restaurant from a specified user's active list; an active voting message and tally are refreshed automatically (administrator).
 - `/add user restaurant score` — store a manual historical score (administrator).
 - `/forceadd restaurant user` — add a restaurant to the voting pool for a user without applying the per-user or pool-size limits (administrator).
 - `/force-open phase [minutes] [restaurant]` — immediately open recommendations, voting, or rating for debugging. Test periods default to five minutes; forced rating uses the oldest queued restaurant unless one is named (administrator).

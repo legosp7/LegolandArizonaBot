@@ -50,6 +50,37 @@ async def save_user(session: AsyncSession, member: discord.abc.User) -> None:
         session.add(User(id=member.id, display_name=member.display_name))
 
 
+async def build_vote_tally_embed(
+    sessions: async_sessionmaker[AsyncSession],
+    cycle_id: int,
+    options: list[Recommendation],
+    page: int,
+    deadline: datetime,
+) -> discord.Embed:
+    page_count = max(1, (len(options) + 24) // 25)
+    page = min(max(page, 0), page_count - 1)
+    visible = options[page * 25:(page + 1) * 25]
+    ids = [item.id for item in visible]
+    async with sessions() as session:
+        rows = (await session.execute(
+            select(Vote.recommendation_id, func.count(Vote.id))
+            .where(Vote.cycle_id == cycle_id, Vote.recommendation_id.in_(ids))
+            .group_by(Vote.recommendation_id)
+        )).all() if ids else []
+    counts = {recommendation_id: count for recommendation_id, count in rows}
+    embed = discord.Embed(
+        title="Live Restaurant Vote Tally",
+        description="\n".join(
+            f"**{item.name[:100]}** — {counts.get(item.id, 0)} vote{'s' if counts.get(item.id, 0) != 1 else ''}"
+            for item in visible
+        ) or "No restaurants are available on this page.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Voting closes", value=discord.utils.format_dt(deadline, "R"), inline=False)
+    embed.set_footer(text=f"Live tally · Page {page + 1}/{page_count} · Updated as ballots are submitted")
+    return embed
+
+
 class VoteSelect(discord.ui.Select):
     def __init__(self, options: list[Recommendation]) -> None:
         self.page_ids = [item.id for item in options]
@@ -71,11 +102,18 @@ class VoteSelect(discord.ui.Select):
         if now_utc() >= view.deadline:
             await interaction.response.send_message("Voting has closed.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         choices = {int(value) for value in self.values}
         async with view.sessions.begin() as session:
             await session.execute(delete(Vote).where(Vote.cycle_id == view.cycle_id, Vote.user_id == interaction.user.id, Vote.recommendation_id.in_(self.page_ids)))
             session.add_all(Vote(cycle_id=view.cycle_id, user_id=interaction.user.id, recommendation_id=item) for item in choices)
-        await interaction.response.send_message(f"Saved {len(choices)} choice{'s' if len(choices) != 1 else ''} on this page. Submit again to replace this page's choices.", ephemeral=True)
+        if interaction.message:
+            embed = await build_vote_tally_embed(view.sessions, view.cycle_id, view.options, view.page, view.deadline)
+            try:
+                await interaction.message.edit(embed=embed, view=view)
+            except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+                pass
+        await interaction.followup.send(f"Saved {len(choices)} choice{'s' if len(choices) != 1 else ''} on this page. Submit again to replace this page's choices.", ephemeral=True)
 
 
 class VoteView(discord.ui.View):
@@ -105,12 +143,14 @@ class VoteView(discord.ui.View):
     async def previous_page(self, interaction: discord.Interaction) -> None:
         self.page = max(0, self.page - 1)
         self.render_page()
-        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", view=self)
+        embed = await build_vote_tally_embed(self.sessions, self.cycle_id, self.options, self.page, self.deadline)
+        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", embed=embed, view=self)
 
     async def next_page(self, interaction: discord.Interaction) -> None:
         self.page = min(self.page_count - 1, self.page + 1)
         self.render_page()
-        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", view=self)
+        embed = await build_vote_tally_embed(self.sessions, self.cycle_id, self.options, self.page, self.deadline)
+        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", embed=embed, view=self)
 
 
 class RatingSelect(discord.ui.Select):
@@ -217,7 +257,11 @@ class RestaurantBot(discord.Client):
                 if channel and hasattr(channel, "fetch_message"):
                     try:
                         message = await channel.fetch_message(cycle.message_id)  # type: ignore[attr-defined]
-                        await message.edit(view=view)
+                        if cycle.status == "voting" and isinstance(view, VoteView):
+                            embed = await build_vote_tally_embed(self.sessions, cycle.id, view.options, view.page, deadline)
+                            await message.edit(embed=embed, view=view)
+                        else:
+                            await message.edit(view=view)
                     except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                         pass
 
@@ -292,7 +336,11 @@ class RestaurantBot(discord.Client):
                 view = VoteView(self.sessions, cycle.id, cycle.deadline, options)
         channel = await self.get_channel_messageable(channel_id)
         if channel:
-            sent = await channel.send(message, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
+            embed = await build_vote_tally_embed(self.sessions, cycle_id, options, 0, view.deadline) if isinstance(view, VoteView) else None
+            if embed:
+                sent = await channel.send(message, embed=embed, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
+            else:
+                sent = await channel.send(message, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
             if view:
                 async with self.sessions.begin() as session:
                     saved = await session.get(Cycle, cycle_id)
@@ -330,6 +378,38 @@ class RestaurantBot(discord.Client):
         event_text = await self.create_event(guild_id, winner.name)
         if channel:
             await channel.send(f"{ping()} **{winner.name}** won with **{votes}** vote{'s' if votes != 1 else ''}!{event_text}", allowed_mentions=discord.AllowedMentions(roles=True))
+
+    async def refresh_vote_message(self, cycle_id: int) -> None:
+        async with self.sessions() as session:
+            cycle = await session.get(Cycle, cycle_id)
+            if not cycle or cycle.status != "voting" or not cycle.message_id:
+                return
+            options = list((await session.scalars(
+                select(Recommendation)
+                .join(CycleOption, CycleOption.recommendation_id == Recommendation.id)
+                .where(CycleOption.cycle_id == cycle.id)
+                .order_by(Recommendation.name)
+            )).all())
+            deadline = aware(cycle.deadline)
+            channel_id, message_id = cycle.channel_id, cycle.message_id
+        if not options or not deadline:
+            await self.close_vote(cycle_id)
+            return
+        channel = await self.get_channel_messageable(channel_id)
+        if not channel or not hasattr(channel, "fetch_message"):
+            return
+        view = VoteView(self.sessions, cycle_id, deadline, options)
+        embed = await build_vote_tally_embed(self.sessions, cycle_id, options, 0, deadline)
+        try:
+            message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+            await message.edit(
+                content=f"{ping()} Voting closes {discord.utils.format_dt(deadline, 'R')}. Page 1/{view.page_count}; selections are saved per page.",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+        except (discord.HTTPException, discord.Forbidden, discord.NotFound):
+            pass
 
     async def create_event(self, guild_id: int, restaurant: str) -> str:
         guild = self.get_guild(guild_id)
@@ -494,6 +574,47 @@ class EmbedPages(discord.ui.View):
         await interaction.response.edit_message(embed=self.pages[self.index], view=self)
 
 
+@bot.tree.command(name="viewballot", description="View a snapshot of the current restaurant vote results")
+async def view_ballot(interaction: discord.Interaction) -> None:
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    cycle = await current_cycle(interaction.guild_id, "voting")
+    if not cycle:
+        await interaction.response.send_message("There is no active restaurant vote.", ephemeral=True)
+        return
+    async with bot.sessions() as session:
+        rows = (await session.execute(
+            select(Recommendation.name, func.count(Vote.id))
+            .join(CycleOption, CycleOption.recommendation_id == Recommendation.id)
+            .outerjoin(Vote, (Vote.recommendation_id == Recommendation.id) & (Vote.cycle_id == cycle.id))
+            .where(CycleOption.cycle_id == cycle.id)
+            .group_by(Recommendation.id)
+            .order_by(func.count(Vote.id).desc(), Recommendation.name)
+        )).all()
+    chunks = [rows[i:i + 10] for i in range(0, len(rows), 10)] or [[]]
+    pages: list[discord.Embed] = []
+    deadline = aware(cycle.deadline)
+    for page_number, chunk in enumerate(chunks, 1):
+        embed = discord.Embed(title="Current Restaurant Ballot", color=discord.Color.blurple())
+        if chunk:
+            offset = (page_number - 1) * 10
+            embed.description = "\n\n".join(
+                f"**{offset + index}. {name}** — {count} vote{'s' if count != 1 else ''}"
+                for index, (name, count) in enumerate(chunk, 1)
+            )
+        else:
+            embed.description = "No restaurants are available in the active ballot."
+        if deadline:
+            embed.add_field(name="Voting closes", value=discord.utils.format_dt(deadline, "R"), inline=False)
+        embed.set_footer(text=f"Snapshot · Page {page_number}/{len(chunks)} · Run /viewballot again to refresh")
+        pages.append(embed)
+    if len(pages) > 1:
+        await interaction.response.send_message(embed=pages[0], view=EmbedPages(pages, interaction.user.id))
+    else:
+        await interaction.response.send_message(embed=pages[0])
+
+
 @bot.tree.command(name="recommendations", description="View all restaurants currently in the voting pool")
 async def active_recommendations(interaction: discord.Interaction) -> None:
     if not interaction.guild_id:
@@ -600,6 +721,84 @@ async def skip(interaction: discord.Interaction) -> None:
         saved = await session.get(Cycle, cycle.id)
         saved.status, saved.deadline = "skipped", None
     await interaction.response.send_message("This week's process has been skipped.")
+
+
+@bot.tree.command(name="end-process", description="Immediately end the current recommendation, voting, or rating phase")
+@app_commands.default_permissions(administrator=True)
+async def end_process(interaction: discord.Interaction) -> None:
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    cycle = await current_cycle(interaction.guild_id, "recommending", "voting", "rating", "selected")
+    if not cycle:
+        await interaction.response.send_message("There is no active process to end.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if cycle.status == "recommending":
+        await bot.open_vote(cycle.id)
+        result = "The recommendation phase ended early. Voting has now opened."
+    elif cycle.status == "voting":
+        await bot.close_vote(cycle.id)
+        result = "Voting ended early and the winner was processed."
+    elif cycle.status == "rating":
+        await bot.close_rating(cycle.id)
+        result = "Rating ended early and the result was processed."
+    else:
+        async with bot.sessions.begin() as session:
+            saved = await session.get(Cycle, cycle.id)
+            if saved:
+                saved.status, saved.deadline = "complete", None
+        result = "The selected phase was ended. No rating was recorded."
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(name="admin-remove", description="Remove a restaurant credited to a specified user")
+@app_commands.describe(user="User whose recommendation should be removed", restaurant="Exact restaurant name to remove")
+@app_commands.default_permissions(administrator=True)
+async def admin_remove(interaction: discord.Interaction, user: discord.Member, restaurant: app_commands.Range[str, 1, 200]) -> None:
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    name_key = " ".join(restaurant.strip().split()).casefold()
+    await interaction.response.defer(ephemeral=True)
+    async with bot.sessions.begin() as session:
+        item = await session.scalar(select(Recommendation).where(
+            Recommendation.guild_id == interaction.guild_id,
+            Recommendation.recommender_id == user.id,
+            Recommendation.name_key == name_key,
+        ))
+        if not item:
+            removed_name = None
+            active_cycle_ids: list[int] = []
+            blocked = False
+        else:
+            blocked = bool(await session.scalar(select(Cycle.id).where(
+                Cycle.winner_id == item.id,
+                Cycle.status.in_(["selected", "rating"]),
+            ).limit(1)))
+            if blocked:
+                removed_name = None
+                active_cycle_ids = []
+            else:
+                active_cycle_ids = list((await session.scalars(
+                    select(Cycle.id)
+                    .join(CycleOption, CycleOption.cycle_id == Cycle.id)
+                    .where(CycleOption.recommendation_id == item.id, Cycle.status == "voting")
+                    .distinct()
+                )).all())
+                removed_name = item.name
+                await session.execute(delete(Vote).where(Vote.recommendation_id == item.id))
+                await session.execute(delete(CycleOption).where(CycleOption.recommendation_id == item.id))
+                await session.delete(item)
+    if blocked:
+        await interaction.followup.send("That restaurant has already won and cannot be removed while selection or rating is active. End the process first.", ephemeral=True)
+        return
+    if removed_name is None:
+        await interaction.followup.send(f"**{user.display_name}** does not have that active recommendation.", ephemeral=True)
+        return
+    for cycle_id in active_cycle_ids:
+        await bot.refresh_vote_message(cycle_id)
+    await interaction.followup.send(f"Removed **{removed_name}** from **{user.display_name}**'s active recommendations.", ephemeral=True)
 
 
 @bot.tree.command(name="force-clear", description="Permanently clear all bot data (administrator only)")
