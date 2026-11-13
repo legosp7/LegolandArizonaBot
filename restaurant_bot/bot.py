@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -62,6 +63,7 @@ async def build_vote_tally_embed(
     visible = options[page * 25:(page + 1) * 25]
     ids = [item.id for item in visible]
     async with sessions() as session:
+        cycle = await session.get(Cycle, cycle_id)
         rows = (await session.execute(
             select(Vote.recommendation_id, func.count(Vote.id))
             .where(Vote.cycle_id == cycle_id, Vote.recommendation_id.in_(ids))
@@ -69,7 +71,7 @@ async def build_vote_tally_embed(
         )).all() if ids else []
     counts = {recommendation_id: count for recommendation_id, count in rows}
     embed = discord.Embed(
-        title="Live Restaurant Vote Tally",
+        title="Live Restaurant Runoff Tally" if cycle and cycle.runoff_round else "Live Restaurant Vote Tally",
         description="\n".join(
             f"**{item.name[:100]}** — {counts.get(item.id, 0)} vote{'s' if counts.get(item.id, 0) != 1 else ''}"
             for item in visible
@@ -356,13 +358,31 @@ class RestaurantBot(discord.Client):
             rows = (await session.execute(select(Recommendation, func.count(Vote.id)).join(CycleOption, CycleOption.recommendation_id == Recommendation.id).outerjoin(Vote, (Vote.recommendation_id == Recommendation.id) & (Vote.cycle_id == cycle.id)).where(CycleOption.cycle_id == cycle.id).group_by(Recommendation.id).order_by(func.count(Vote.id).desc(), Recommendation.created_at))).all()
             if not rows:
                 cycle.status, cycle.deadline = "complete", None
+                outcome = "empty"
                 winner = None
-                votes = 0
-                guild_id = cycle.guild_id
+                winning_votes = 0
+                runoff_options: list[Recommendation] = []
+                decided_by_coin = False
             else:
-                winner, votes = rows[0]
-                cycle.winner_id, cycle.status, cycle.deadline = winner.id, "selected", None
-                guild_id = cycle.guild_id
+                winning_votes = rows[0][1]
+                tied = [restaurant for restaurant, count in rows if count == winning_votes]
+                decided_by_coin = len(rows) == 2 and len(tied) == 2 and (cycle.runoff_round or 0) >= 1
+                if len(tied) == 1 or decided_by_coin:
+                    winner = tied[0] if len(tied) == 1 else secrets.choice(tied)
+                    cycle.winner_id, cycle.status, cycle.deadline = winner.id, "selected", None
+                    outcome = "winner"
+                    runoff_options = []
+                else:
+                    winner = None
+                    outcome = "runoff"
+                    runoff_options = tied
+                    await session.execute(delete(Vote).where(Vote.cycle_id == cycle.id))
+                    await session.execute(delete(CycleOption).where(CycleOption.cycle_id == cycle.id))
+                    session.add_all(CycleOption(cycle_id=cycle.id, recommendation_id=item.id) for item in tied)
+                    cycle.runoff_round = (cycle.runoff_round or 0) + 1
+                    cycle.deadline = now_utc() + timedelta(hours=1)
+                    cycle.message_id = None
+            guild_id = cycle.guild_id
 
         channel = await self.get_channel_messageable(channel_id)
         if channel and message_id and hasattr(channel, "fetch_message"):
@@ -371,13 +391,40 @@ class RestaurantBot(discord.Client):
                 await voting_message.delete()
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-        if winner is None:
+        if outcome == "empty":
             if channel:
                 await channel.send(f"{ping()} Voting closed without any available restaurants.", allowed_mentions=discord.AllowedMentions(roles=True))
             return
+        if outcome == "runoff":
+            if not channel:
+                return
+            async with self.sessions() as session:
+                saved_cycle = await session.get(Cycle, cycle_id)
+                runoff_deadline = aware(saved_cycle.deadline) if saved_cycle else None
+                runoff_round = saved_cycle.runoff_round if saved_cycle else 1
+            if not runoff_deadline:
+                return
+            view = VoteView(self.sessions, cycle_id, runoff_deadline, runoff_options)
+            embed = await build_vote_tally_embed(self.sessions, cycle_id, runoff_options, 0, runoff_deadline)
+            shown = runoff_options[:15]
+            names = ", ".join(f"**{item.name[:80]}**" for item in shown)
+            if len(runoff_options) > len(shown):
+                names += f", and {len(runoff_options) - len(shown)} more"
+            message = await channel.send(
+                f"{ping()} The vote tied between {names}. Runoff round {runoff_round} is open for one hour.",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
+            async with self.sessions.begin() as session:
+                saved_cycle = await session.get(Cycle, cycle_id)
+                if saved_cycle and saved_cycle.status == "voting":
+                    saved_cycle.message_id = message.id
+            return
         event_text = await self.create_event(guild_id, winner.name)
         if channel:
-            await channel.send(f"{ping()} **{winner.name}** won with **{votes}** vote{'s' if votes != 1 else ''}!{event_text}", allowed_mentions=discord.AllowedMentions(roles=True))
+            method = " The runoff remained tied, so the winner was chosen by coin flip." if decided_by_coin else ""
+            await channel.send(f"{ping()} **{winner.name}** won with **{winning_votes}** vote{'s' if winning_votes != 1 else ''}!{method}{event_text}", allowed_mentions=discord.AllowedMentions(roles=True))
 
     async def refresh_vote_message(self, cycle_id: int) -> None:
         async with self.sessions() as session:
@@ -596,7 +643,8 @@ async def view_ballot(interaction: discord.Interaction) -> None:
     pages: list[discord.Embed] = []
     deadline = aware(cycle.deadline)
     for page_number, chunk in enumerate(chunks, 1):
-        embed = discord.Embed(title="Current Restaurant Ballot", color=discord.Color.blurple())
+        title = f"Current Runoff Ballot · Round {cycle.runoff_round}" if cycle.runoff_round else "Current Restaurant Ballot"
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
         if chunk:
             offset = (page_number - 1) * 10
             embed.description = "\n\n".join(
@@ -613,6 +661,72 @@ async def view_ballot(interaction: discord.Interaction) -> None:
         await interaction.response.send_message(embed=pages[0], view=EmbedPages(pages, interaction.user.id))
     else:
         await interaction.response.send_message(embed=pages[0])
+
+
+@bot.tree.command(name="votingrecord", description="Privately view who selected each restaurant in the active vote")
+@app_commands.default_permissions(administrator=True)
+async def voting_record(interaction: discord.Interaction) -> None:
+    if not interaction.guild_id or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command must be used by an administrator in a server.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only administrators can view voting records.", ephemeral=True)
+        return
+    cycle = await current_cycle(interaction.guild_id, "voting")
+    if not cycle:
+        await interaction.response.send_message("There is no active restaurant vote.", ephemeral=True)
+        return
+    async with bot.sessions() as session:
+        rows = (await session.execute(
+            select(Recommendation.name, Vote.user_id)
+            .join(CycleOption, CycleOption.recommendation_id == Recommendation.id)
+            .outerjoin(Vote, (Vote.recommendation_id == Recommendation.id) & (Vote.cycle_id == cycle.id))
+            .where(CycleOption.cycle_id == cycle.id)
+            .order_by(Recommendation.name, Vote.user_id)
+        )).all()
+    records: dict[str, list[int]] = {}
+    for restaurant_name, voter_id in rows:
+        records.setdefault(restaurant_name, [])
+        if voter_id is not None:
+            records[restaurant_name].append(voter_id)
+
+    fields: list[tuple[str, str]] = []
+    for restaurant_name, voter_ids in records.items():
+        mentions = [f"<@{voter_id}>" for voter_id in voter_ids]
+        if not mentions:
+            fields.append((restaurant_name[:256], "No votes"))
+            continue
+        chunks: list[str] = []
+        current = ""
+        for mention in mentions:
+            candidate = f"{current}, {mention}" if current else mention
+            if len(candidate) > 900:
+                chunks.append(current)
+                current = mention
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        for index, voter_chunk in enumerate(chunks):
+            suffix = "" if index == 0 else " (continued)"
+            fields.append((f"{restaurant_name[:244]}{suffix}", voter_chunk))
+
+    field_pages = [fields[i:i + 5] for i in range(0, len(fields), 5)] or [[]]
+    pages: list[discord.Embed] = []
+    for page_number, page_fields in enumerate(field_pages, 1):
+        title = f"Private Runoff Voting Record · Round {cycle.runoff_round}" if cycle.runoff_round else "Private Voting Record"
+        embed = discord.Embed(title=title, color=discord.Color.dark_gold())
+        embed.description = "Only you can see this administrator audit snapshot."
+        for field_name, field_value in page_fields:
+            embed.add_field(name=field_name, value=field_value, inline=False)
+        if not page_fields:
+            embed.add_field(name="Ballot", value="No voting options are available.", inline=False)
+        embed.set_footer(text=f"Page {page_number}/{len(field_pages)} · Run /votingrecord again to refresh")
+        pages.append(embed)
+    if len(pages) > 1:
+        await interaction.response.send_message(embed=pages[0], view=EmbedPages(pages, interaction.user.id), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=pages[0], ephemeral=True)
 
 
 @bot.tree.command(name="recommendations", description="View all restaurants currently in the voting pool")

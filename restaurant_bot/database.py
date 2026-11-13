@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, inspect
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -42,6 +42,7 @@ class Cycle(Base):
     message_id: Mapped[int | None] = mapped_column(BigInteger)
     winner_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"))
     event_id: Mapped[int | None] = mapped_column(BigInteger)
+    runoff_round: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class CycleOption(Base):
@@ -105,3 +106,10 @@ def create_session_factory(database_url: str | None = None) -> tuple[AsyncEngine
 async def create_tables(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+
+        def add_missing_columns(sync_connection: object) -> None:
+            column_names = {column["name"] for column in inspect(sync_connection).get_columns("cycles")}  # type: ignore[arg-type]
+            if "runoff_round" not in column_names:
+                sync_connection.exec_driver_sql("ALTER TABLE cycles ADD COLUMN runoff_round INTEGER NOT NULL DEFAULT 0")  # type: ignore[attr-defined]
+
+        await connection.run_sync(add_missing_columns)
