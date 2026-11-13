@@ -672,9 +672,10 @@ async def voting_record(interaction: discord.Interaction) -> None:
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Only administrators can view voting records.", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     cycle = await current_cycle(interaction.guild_id, "voting")
     if not cycle:
-        await interaction.response.send_message("There is no active restaurant vote.", ephemeral=True)
+        await interaction.followup.send("There is no active restaurant vote.", ephemeral=True)
         return
     async with bot.sessions() as session:
         rows = (await session.execute(
@@ -724,9 +725,9 @@ async def voting_record(interaction: discord.Interaction) -> None:
         embed.set_footer(text=f"Page {page_number}/{len(field_pages)} · Run /votingrecord again to refresh")
         pages.append(embed)
     if len(pages) > 1:
-        await interaction.response.send_message(embed=pages[0], view=EmbedPages(pages, interaction.user.id), ephemeral=True)
+        await interaction.followup.send(embed=pages[0], view=EmbedPages(pages, interaction.user.id), ephemeral=True)
     else:
-        await interaction.response.send_message(embed=pages[0], ephemeral=True)
+        await interaction.followup.send(embed=pages[0], ephemeral=True)
 
 
 @bot.tree.command(name="recommendations", description="View all restaurants currently in the voting pool")
