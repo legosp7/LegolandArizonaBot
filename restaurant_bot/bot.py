@@ -355,6 +355,7 @@ class RestaurantBot(discord.Client):
             if not cycle or cycle.status != "voting":
                 return
             channel_id, message_id = cycle.channel_id, cycle.message_id
+            closing_round = cycle.runoff_round or 0
             rows = (await session.execute(select(Recommendation, func.count(Vote.id)).join(CycleOption, CycleOption.recommendation_id == Recommendation.id).outerjoin(Vote, (Vote.recommendation_id == Recommendation.id) & (Vote.cycle_id == cycle.id)).where(CycleOption.cycle_id == cycle.id).group_by(Recommendation.id).order_by(func.count(Vote.id).desc(), Recommendation.created_at))).all()
             if not rows:
                 cycle.status, cycle.deadline = "complete", None
@@ -385,10 +386,31 @@ class RestaurantBot(discord.Client):
             guild_id = cycle.guild_id
 
         channel = await self.get_channel_messageable(channel_id)
+        final_tally = discord.Embed(
+            title="Final Runoff Tally" if closing_round else "Final Vote Tally",
+            color=discord.Color.blurple(),
+        )
+        if rows:
+            shown_rows = rows[:25]
+            final_tally.description = "\n".join(
+                f"**{index}. {restaurant.name[:100]}** — {count} vote{'s' if count != 1 else ''}"
+                for index, (restaurant, count) in enumerate(shown_rows, 1)
+            )
+            if len(rows) > len(shown_rows):
+                final_tally.description += f"\n\n*{len(rows) - len(shown_rows)} additional restaurants omitted from this embed.*"
+        else:
+            final_tally.description = "No restaurants were available when this ballot closed."
+        final_tally.set_footer(text=f"Runoff round {closing_round} closed · Final results" if closing_round else "Voting closed · Final results")
         if channel and message_id and hasattr(channel, "fetch_message"):
             try:
                 voting_message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
-                await voting_message.delete()
+                if outcome == "runoff":
+                    closed_content = "This ballot closed in a tie. A one-hour runoff has opened below."
+                elif outcome == "winner":
+                    closed_content = "Voting has closed. The final tally is preserved below."
+                else:
+                    closed_content = "Voting has closed without an available restaurant."
+                await voting_message.edit(content=closed_content, embed=final_tally, view=None)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
         if outcome == "empty":

@@ -66,7 +66,7 @@ docker compose down
 
 1. On Monday, a 24-hour recommendation window opens and pings the configured role.
 2. Eligible users use `/recommend restaurant`; each may keep up to two active entries. `/remove` opens a private selection menu.
-3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool. Its attached embed shows a live per-restaurant vote tally and refreshes after every ballot (25 restaurants per page).
+3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool. Its attached embed shows a live per-restaurant vote tally and refreshes after every ballot (25 restaurants per page). When the ballot closes, its controls are removed but the message remains as a read-only final tally.
 4. The winner is announced, an external Discord event is created, and the winning recommendation waits for Friday. A tie opens a fresh one-hour runoff containing only the tied leaders. If a runoff remains tied between two restaurants, the bot chooses the winner by coin flip; larger ties continue to another one-hour runoff.
 5. An administrator runs `/rate` on or after Friday. The role receives a 1–10 selector for 24 hours.
 6. The bot averages and announces the score and nominator, stores the result, and removes only the winning restaurant. All other recommendations carry into the next week.
