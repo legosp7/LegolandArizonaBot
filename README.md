@@ -73,6 +73,10 @@ docker compose down
 
 All deadlines and responses are stored in the database and active voting/rating controls are restored after a restart.
 
+Each server may have only one active cycle, including a selected restaurant waiting for ratings. A previous week's unfinished forced cycle blocks a new automatic opening until it is finished or skipped. `/force-open` explicitly replaces the active cycle in one transaction; invalid voting/rating requests leave it intact. Replaced ballots no longer accept votes or ratings.
+
+Automatic Monday openings also claim a unique server/week record before posting, preventing simultaneous scheduler instances from posting duplicate cycles against the same database. On upgrade, if overlapping active cycles already exist, the newest is retained and older cycles are marked skipped with their history preserved. These guards require instances to share the same persistent database.
+
 ## Commands
 
 - `/recommend restaurant` — add a recommendation during the open window (voter role).

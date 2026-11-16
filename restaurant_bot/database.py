@@ -4,7 +4,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, inspect
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, func, inspect, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -43,6 +44,52 @@ class Cycle(Base):
     winner_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"))
     event_id: Mapped[int | None] = mapped_column(BigInteger)
     runoff_round: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+ACTIVE_CYCLE_STATUSES = ("recommending", "voting", "selected", "rating")
+
+
+class WeeklyCycleClaim(Base):
+    __tablename__ = "weekly_cycle_claims"
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    week_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+
+
+async def claim_cycle(
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    guild_id: int,
+    channel_id: int,
+    opened_at: datetime,
+    deadline: datetime | None,
+    status: str = "recommending",
+    winner_id: int | None = None,
+    week_start: datetime | None = None,
+    replace_active: bool = False,
+) -> Cycle | None:
+    """Claim a cycle before sending Discord messages; concurrent losers send nothing."""
+    try:
+        async with sessions.begin() as session:
+            if week_start is not None:
+                existing = await session.scalar(select(Cycle.id).where(
+                    Cycle.guild_id == guild_id, Cycle.opened_at >= week_start,
+                ).limit(1))
+                if existing is not None:
+                    return None
+                session.add(WeeklyCycleClaim(guild_id=guild_id, week_start=week_start))
+            if replace_active:
+                await session.execute(update(Cycle).where(
+                    Cycle.guild_id == guild_id, Cycle.status.in_(ACTIVE_CYCLE_STATUSES),
+                ).values(status="skipped", deadline=None))
+            cycle = Cycle(guild_id=guild_id, channel_id=channel_id, status=status,
+                          opened_at=opened_at, deadline=deadline, winner_id=winner_id)
+            session.add(cycle)
+            await session.flush()
+        return cycle
+    except IntegrityError:
+        # A weekly claim or active cycle already exists. The entire transaction,
+        # including any attempted replacement, has been rolled back.
+        return None
 
 
 class CycleOption(Base):
@@ -113,3 +160,16 @@ async def create_tables(engine: AsyncEngine) -> None:
                 sync_connection.exec_driver_sql("ALTER TABLE cycles ADD COLUMN runoff_round INTEGER NOT NULL DEFAULT 0")  # type: ignore[attr-defined]
 
         await connection.run_sync(add_missing_columns)
+
+        # Keep the newest active cycle in each server when upgrading a database
+        # that already contains overlaps. Preserve its votes and historical rows.
+        await connection.execute(update(Cycle).where(
+            Cycle.status.in_(ACTIVE_CYCLE_STATUSES),
+            Cycle.id.not_in(select(func.max(Cycle.id)).where(
+                Cycle.status.in_(ACTIVE_CYCLE_STATUSES),
+            ).group_by(Cycle.guild_id)),
+        ).values(status="skipped", deadline=None))
+        await connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_cycle_active_guild ON cycles (guild_id) "
+            "WHERE status IN ('recommending', 'voting', 'selected', 'rating')"
+        )

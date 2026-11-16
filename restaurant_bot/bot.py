@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .database import Cycle, CycleOption, Rating, Recommendation, RestaurantResult, User, Vote, create_session_factory, create_tables
+from .database import Cycle, CycleOption, Rating, Recommendation, RestaurantResult, User, Vote, WeeklyCycleClaim, claim_cycle, create_session_factory, create_tables
 
 load_dotenv()
 UTC = timezone.utc
@@ -107,6 +107,10 @@ class VoteSelect(discord.ui.Select):
         await interaction.response.defer(ephemeral=True)
         choices = {int(value) for value in self.values}
         async with view.sessions.begin() as session:
+            cycle = await session.get(Cycle, view.cycle_id)
+            if not cycle or cycle.status != "voting" or aware(cycle.deadline) <= now_utc():
+                await interaction.followup.send("This ballot has closed or was replaced.", ephemeral=True)
+                return
             await session.execute(delete(Vote).where(Vote.cycle_id == view.cycle_id, Vote.user_id == interaction.user.id, Vote.recommendation_id.in_(self.page_ids)))
             session.add_all(Vote(cycle_id=view.cycle_id, user_id=interaction.user.id, recommendation_id=item) for item in choices)
         if interaction.message:
@@ -171,6 +175,10 @@ class RatingSelect(discord.ui.Select):
             return
         score = int(self.values[0])
         async with view.sessions.begin() as session:
+            cycle = await session.get(Cycle, view.cycle_id)
+            if not cycle or cycle.status != "rating" or aware(cycle.deadline) <= now_utc():
+                await interaction.response.send_message("This rating has closed or was replaced.", ephemeral=True)
+                return
             row = await session.scalar(select(Rating).where(Rating.cycle_id == view.cycle_id, Rating.user_id == interaction.user.id))
             if row:
                 row.score = score
@@ -291,21 +299,24 @@ class RestaurantBot(discord.Client):
                 continue
             channel_id = int(channel_env) if channel_env else previous_channel
             if channel_id:
-                await self.start_cycle(guild.id, channel_id)
+                await self.start_cycle(guild.id, channel_id, week_start=start)
 
-    async def start_cycle(self, guild_id: int, channel_id: int, duration: timedelta = timedelta(hours=24)) -> Cycle | None:
+    async def start_cycle(self, guild_id: int, channel_id: int, duration: timedelta = timedelta(hours=24), *, week_start: datetime | None = None, replace_active: bool = False) -> Cycle | None:
         channel = await self.get_channel_messageable(channel_id)
         if not channel:
             return None
         opened, deadline = now_utc(), now_utc() + duration
+        cycle = await claim_cycle(self.sessions, guild_id=guild_id, channel_id=channel_id,
+                                 opened_at=opened, deadline=deadline, week_start=week_start,
+                                 replace_active=replace_active)
+        if cycle is None:
+            return None
+        message = await channel.send(f"{ping()} Restaurant recommendations are open for {discord.utils.format_dt(deadline, 'R')}! Use `/recommend` (maximum two active recommendations each).", allowed_mentions=discord.AllowedMentions(roles=True))
         async with self.sessions.begin() as session:
-            cycle = Cycle(guild_id=guild_id, channel_id=channel_id, status="recommending", opened_at=opened, deadline=deadline)
-            session.add(cycle)
-            await session.flush()
-            cycle_id = cycle.id
-        await channel.send(f"{ping()} Restaurant recommendations are open for {discord.utils.format_dt(deadline, 'R')}! Use `/recommend` (maximum two active recommendations each).", allowed_mentions=discord.AllowedMentions(roles=True))
-        async with self.sessions() as session:
-            return await session.get(Cycle, cycle_id)
+            saved = await session.get(Cycle, cycle.id)
+            if saved:
+                saved.message_id = message.id
+        return cycle
 
     async def advance_expired(self) -> None:
         async with self.sessions() as session:
@@ -957,7 +968,7 @@ async def force_clear(interaction: discord.Interaction, confirm: str) -> None:
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
     async with bot.sessions.begin() as session:
-        for model in (Rating, Vote, CycleOption, RestaurantResult, Cycle, Recommendation, User):
+        for model in (Rating, Vote, CycleOption, RestaurantResult, WeeklyCycleClaim, Cycle, Recommendation, User):
             await session.execute(delete(model))
     await interaction.followup.send("The bot database has been permanently cleared. Existing vote/rating components were disabled.", ephemeral=True)
 
@@ -982,15 +993,11 @@ async def force_open(
     duration = timedelta(minutes=minutes)
     await interaction.response.defer(ephemeral=True)
 
-    active = await current_cycle(interaction.guild_id, "recommending", "voting", "selected", "rating")
-    if active:
-        async with bot.sessions.begin() as session:
-            saved = await session.get(Cycle, active.id)
-            if saved:
-                saved.status, saved.deadline = "skipped", None
-
     if phase.value == "recommendations":
-        await bot.start_cycle(interaction.guild_id, interaction.channel_id, duration)
+        cycle = await bot.start_cycle(interaction.guild_id, interaction.channel_id, duration, replace_active=True)
+        if cycle is None:
+            await interaction.followup.send("The cycle could not be opened; check channel access or another opening in progress.", ephemeral=True)
+            return
         result = f"Forced the recommendation period open for {minutes} minute{'s' if minutes != 1 else ''}."
     elif phase.value == "voting":
         async with bot.sessions() as session:
@@ -998,12 +1005,13 @@ async def force_open(
         if not count:
             await interaction.followup.send("Add at least one recommendation before forcing voting open.", ephemeral=True)
             return
-        async with bot.sessions.begin() as session:
-            cycle = Cycle(guild_id=interaction.guild_id, channel_id=interaction.channel_id, status="recommending", opened_at=now_utc(), deadline=now_utc())
-            session.add(cycle)
-            await session.flush()
-            cycle_id = cycle.id
-        await bot.open_vote(cycle_id, duration)
+        cycle = await claim_cycle(bot.sessions, guild_id=interaction.guild_id,
+                                  channel_id=interaction.channel_id, opened_at=now_utc(),
+                                  deadline=now_utc(), replace_active=True)
+        if cycle is None:
+            await interaction.followup.send("Another cycle opening is in progress. Please try again.", ephemeral=True)
+            return
+        await bot.open_vote(cycle.id, duration)
         result = f"Forced voting open for {minutes} minute{'s' if minutes != 1 else ''}."
     else:
         async with bot.sessions() as session:
@@ -1014,14 +1022,14 @@ async def force_open(
         if not winner:
             await interaction.followup.send("That restaurant is not in the recommendation pool." if restaurant else "Add at least one recommendation before forcing rating open.", ephemeral=True)
             return
-        async with bot.sessions.begin() as session:
-            cycle = Cycle(guild_id=interaction.guild_id, channel_id=interaction.channel_id, status="selected", opened_at=now_utc(), deadline=None, winner_id=winner.id)
-            session.add(cycle)
-            await session.flush()
-            cycle_id = cycle.id
-        async with bot.sessions() as session:
-            saved_cycle = await session.get(Cycle, cycle_id)
-            await bot.begin_rating(saved_cycle, duration)
+        cycle = await claim_cycle(bot.sessions, guild_id=interaction.guild_id,
+                                  channel_id=interaction.channel_id, opened_at=now_utc(),
+                                  deadline=None, status="selected", winner_id=winner.id,
+                                  replace_active=True)
+        if cycle is None:
+            await interaction.followup.send("Another cycle opening is in progress. Please try again.", ephemeral=True)
+            return
+        await bot.begin_rating(cycle, duration)
         result = f"Forced rating for **{winner.name}** open for {minutes} minute{'s' if minutes != 1 else ''}."
     await interaction.followup.send(result, ephemeral=True)
 
