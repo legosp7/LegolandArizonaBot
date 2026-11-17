@@ -33,9 +33,34 @@ def role_id() -> int | None:
     return int(value) if value else None
 
 
+def admin_role_id() -> int | None:
+    value = os.getenv("ADMIN_ROLE_ID", "").strip()
+    return int(value) if value else None
+
+
 def has_voter_role(member: discord.abc.User) -> bool:
     required = role_id()
     return isinstance(member, discord.Member) and required is not None and any(role.id == required for role in member.roles)
+
+
+def has_admin_access(member: discord.abc.User) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    configured_role = admin_role_id()
+    return member.guild_permissions.administrator or (
+        configured_role is not None and any(role.id == configured_role for role in member.roles)
+    )
+
+
+async def require_admin_access(interaction: discord.Interaction) -> bool:
+    if has_admin_access(interaction.user):
+        return True
+    message = "You need Administrator permission or the configured admin role to use this command."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+    return False
 
 
 def ping() -> str:
@@ -84,13 +109,13 @@ async def build_vote_tally_embed(
 
 
 class VoteSelect(discord.ui.Select):
-    def __init__(self, options: list[Recommendation]) -> None:
+    def __init__(self, options: list[Recommendation], single_selection: bool = False) -> None:
         self.page_ids = [item.id for item in options]
         super().__init__(
             custom_id="weekly-restaurant-vote",
-            placeholder="Select every restaurant you would be happy with",
+            placeholder="Choose one restaurant for the runoff" if single_selection else "Select every restaurant you would be happy with",
             min_values=1,
-            max_values=len(options),
+            max_values=1 if single_selection else len(options),
             options=[discord.SelectOption(label=item.name[:100], value=str(item.id)) for item in options],
         )
 
@@ -111,7 +136,10 @@ class VoteSelect(discord.ui.Select):
             if not cycle or cycle.status != "voting" or aware(cycle.deadline) <= now_utc():
                 await interaction.followup.send("This ballot has closed or was replaced.", ephemeral=True)
                 return
-            await session.execute(delete(Vote).where(Vote.cycle_id == view.cycle_id, Vote.user_id == interaction.user.id, Vote.recommendation_id.in_(self.page_ids)))
+            replacement_scope = [Vote.cycle_id == view.cycle_id, Vote.user_id == interaction.user.id]
+            if not view.is_runoff:
+                replacement_scope.append(Vote.recommendation_id.in_(self.page_ids))
+            await session.execute(delete(Vote).where(*replacement_scope))
             session.add_all(Vote(cycle_id=view.cycle_id, user_id=interaction.user.id, recommendation_id=item) for item in choices)
         if interaction.message:
             embed = await build_vote_tally_embed(view.sessions, view.cycle_id, view.options, view.page, view.deadline)
@@ -119,14 +147,16 @@ class VoteSelect(discord.ui.Select):
                 await interaction.message.edit(embed=embed, view=view)
             except (discord.HTTPException, discord.Forbidden, discord.NotFound):
                 pass
-        await interaction.followup.send(f"Saved {len(choices)} choice{'s' if len(choices) != 1 else ''} on this page. Submit again to replace this page's choices.", ephemeral=True)
+        confirmation = "Saved your runoff choice. Submit again to replace it." if view.is_runoff else f"Saved {len(choices)} choice{'s' if len(choices) != 1 else ''} on this page. Submit again to replace this page's choices."
+        await interaction.followup.send(confirmation, ephemeral=True)
 
 
 class VoteView(discord.ui.View):
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], cycle_id: int, deadline: datetime, options: list[Recommendation]) -> None:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession], cycle_id: int, deadline: datetime, options: list[Recommendation], *, is_runoff: bool = False) -> None:
         super().__init__(timeout=max(1, (deadline - now_utc()).total_seconds()))
         self.sessions, self.cycle_id, self.deadline = sessions, cycle_id, deadline
         self.options = options
+        self.is_runoff = is_runoff
         self.page = 0
         self.render_page()
 
@@ -137,7 +167,7 @@ class VoteView(discord.ui.View):
     def render_page(self) -> None:
         self.clear_items()
         start = self.page * 25
-        self.add_item(VoteSelect(self.options[start:start + 25]))
+        self.add_item(VoteSelect(self.options[start:start + 25], self.is_runoff))
         if self.page_count > 1:
             previous = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary, disabled=self.page == 0, custom_id="vote-page-previous")
             next_page = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=self.page >= self.page_count - 1, custom_id="vote-page-next")
@@ -150,13 +180,15 @@ class VoteView(discord.ui.View):
         self.page = max(0, self.page - 1)
         self.render_page()
         embed = await build_vote_tally_embed(self.sessions, self.cycle_id, self.options, self.page, self.deadline)
-        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", embed=embed, view=self)
+        note = "choose one restaurant total" if self.is_runoff else "selections are saved per page"
+        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; {note}.", embed=embed, view=self)
 
     async def next_page(self, interaction: discord.Interaction) -> None:
         self.page = min(self.page_count - 1, self.page + 1)
         self.render_page()
         embed = await build_vote_tally_embed(self.sessions, self.cycle_id, self.options, self.page, self.deadline)
-        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; selections are saved per page.", embed=embed, view=self)
+        note = "choose one restaurant total" if self.is_runoff else "selections are saved per page"
+        await interaction.response.edit_message(content=f"{ping()} Voting closes {discord.utils.format_dt(self.deadline, 'R')}. Page {self.page + 1}/{self.page_count}; {note}.", embed=embed, view=self)
 
 
 class RatingSelect(discord.ui.Select):
@@ -258,7 +290,7 @@ class RestaurantBot(discord.Client):
                 if cycle.status == "voting":
                     options = (await session.scalars(select(Recommendation).join(CycleOption, CycleOption.recommendation_id == Recommendation.id).where(CycleOption.cycle_id == cycle.id).order_by(Recommendation.name))).all()
                     if options:
-                        view: discord.ui.View = VoteView(self.sessions, cycle.id, deadline, list(options))
+                        view: discord.ui.View = VoteView(self.sessions, cycle.id, deadline, list(options), is_runoff=bool(cycle.runoff_round))
                     else:
                         continue
                 else:
@@ -437,7 +469,7 @@ class RestaurantBot(discord.Client):
                 runoff_round = saved_cycle.runoff_round if saved_cycle else 1
             if not runoff_deadline:
                 return
-            view = VoteView(self.sessions, cycle_id, runoff_deadline, runoff_options)
+            view = VoteView(self.sessions, cycle_id, runoff_deadline, runoff_options, is_runoff=True)
             embed = await build_vote_tally_embed(self.sessions, cycle_id, runoff_options, 0, runoff_deadline)
             shown = runoff_options[:15]
             names = ", ".join(f"**{item.name[:80]}**" for item in shown)
@@ -478,7 +510,7 @@ class RestaurantBot(discord.Client):
         channel = await self.get_channel_messageable(channel_id)
         if not channel or not hasattr(channel, "fetch_message"):
             return
-        view = VoteView(self.sessions, cycle_id, deadline, options)
+        view = VoteView(self.sessions, cycle_id, deadline, options, is_runoff=bool(cycle.runoff_round))
         embed = await build_vote_tally_embed(self.sessions, cycle_id, options, 0, deadline)
         try:
             message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
@@ -699,11 +731,11 @@ async def view_ballot(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="votingrecord", description="Privately view who selected each restaurant in the active vote")
 @app_commands.default_permissions(administrator=True)
 async def voting_record(interaction: discord.Interaction) -> None:
-    if not interaction.guild_id or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("This command must be used by an administrator in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only members with Discord Administrator permission can view voting records.", ephemeral=True)
         return
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Only administrators can view voting records.", ephemeral=True)
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     cycle = await current_cycle(interaction.guild_id, "voting")
@@ -857,8 +889,9 @@ async def user_info(interaction: discord.Interaction, user: discord.Member) -> N
 
 
 @bot.tree.command(description="Skip the active weekly process")
-@app_commands.default_permissions(administrator=True)
 async def skip(interaction: discord.Interaction) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         return
     cycle = await current_cycle(interaction.guild_id, "recommending", "voting", "selected", "rating")
@@ -872,8 +905,9 @@ async def skip(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="end-process", description="Immediately end the current recommendation, voting, or rating phase")
-@app_commands.default_permissions(administrator=True)
 async def end_process(interaction: discord.Interaction) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
@@ -902,8 +936,9 @@ async def end_process(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="admin-remove", description="Remove a restaurant credited to a specified user")
 @app_commands.describe(user="User whose recommendation should be removed", restaurant="Exact restaurant name to remove")
-@app_commands.default_permissions(administrator=True)
 async def admin_remove(interaction: discord.Interaction, user: discord.Member, restaurant: app_commands.Range[str, 1, 200]) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
@@ -951,8 +986,9 @@ async def admin_remove(interaction: discord.Interaction, user: discord.Member, r
 
 @bot.tree.command(name="force-clear", description="Permanently clear all bot data (administrator only)")
 @app_commands.describe(confirm="Type CLEAR exactly to confirm the permanent reset")
-@app_commands.default_permissions(administrator=True)
 async def force_clear(interaction: discord.Interaction, confirm: str) -> None:
+    if not await require_admin_access(interaction):
+        return
     if confirm != "CLEAR":
         await interaction.response.send_message("Nothing was deleted. Run the command again with `confirm: CLEAR`.", ephemeral=True)
         return
@@ -980,13 +1016,14 @@ async def force_clear(interaction: discord.Interaction, confirm: str) -> None:
     app_commands.Choice(name="Voting", value="voting"),
     app_commands.Choice(name="Rating", value="rating"),
 ])
-@app_commands.default_permissions(administrator=True)
 async def force_open(
     interaction: discord.Interaction,
     phase: app_commands.Choice[str],
     minutes: app_commands.Range[int, 1, 10080] = 5,
     restaurant: str | None = None,
 ) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id or not interaction.channel_id:
         await interaction.response.send_message("This command must be used in a server channel.", ephemeral=True)
         return
@@ -1035,8 +1072,9 @@ async def force_open(
 
 
 @bot.tree.command(description="Manually add a scored restaurant result")
-@app_commands.default_permissions(administrator=True)
 async def add(interaction: discord.Interaction, user: discord.Member, restaurant: app_commands.Range[str, 1, 200], score: app_commands.Range[float, 1, 10]) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         return
     async with bot.sessions.begin() as session:
@@ -1047,8 +1085,9 @@ async def add(interaction: discord.Interaction, user: discord.Member, restaurant
 
 @bot.tree.command(name="forceadd", description="Add a recommendation without user or pool limits")
 @app_commands.describe(restaurant="Restaurant to add to the voting pool", user="User credited with the recommendation")
-@app_commands.default_permissions(administrator=True)
 async def forceadd(interaction: discord.Interaction, restaurant: app_commands.Range[str, 1, 200], user: discord.Member) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
         return
@@ -1065,8 +1104,9 @@ async def forceadd(interaction: discord.Interaction, restaurant: app_commands.Ra
 
 
 @bot.tree.command(description="Open the 24-hour rating for this week's winning restaurant")
-@app_commands.default_permissions(administrator=True)
 async def rate(interaction: discord.Interaction) -> None:
+    if not await require_admin_access(interaction):
+        return
     if not interaction.guild_id:
         return
     if datetime.now(bot.tz).weekday() < 4:

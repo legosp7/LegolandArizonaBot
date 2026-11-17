@@ -10,7 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from restaurant_bot.database import (
-    ACTIVE_CYCLE_STATUSES, Cycle, WeeklyCycleClaim,
+    ACTIVE_CYCLE_STATUSES, Cycle, Recommendation, User, Vote, WeeklyCycleClaim,
     claim_cycle, create_session_factory, create_tables,
 )
 
@@ -111,10 +111,54 @@ class CycleClaimsTest(unittest.IsolatedAsyncioTestCase):
         interaction = SimpleNamespace(guild_id=1, channel_id=10,
                                       response=SimpleNamespace(defer=AsyncMock()),
                                       followup=SimpleNamespace(send=AsyncMock()))
-        with patch.object(app.bot, "sessions", self.sessions):
+        with patch.object(app.bot, "sessions", self.sessions), patch.object(app, "require_admin_access", AsyncMock(return_value=True)):
             await app.force_open.callback(interaction, app_commands.Choice(name="Voting", value="voting"))
         async with self.sessions() as session:
             self.assertEqual((await session.get(Cycle, old.id)).status, "recommending")
+
+    async def test_runoff_allows_one_choice_across_all_pages(self):
+        import restaurant_bot.bot as app
+
+        deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+        cycle = await self.claim(status="voting", deadline=deadline)
+        async with self.sessions.begin() as session:
+            saved = await session.get(Cycle, cycle.id)
+            saved.runoff_round = 1
+            session.add(User(id=99, display_name="Nominator"))
+            options = [Recommendation(id=index, guild_id=1, name=f"Restaurant {index}",
+                                      name_key=f"restaurant {index}", recommender_id=99,
+                                      created_at=self.monday) for index in range(1, 27)]
+            session.add_all(options)
+            session.add(Vote(cycle_id=cycle.id, user_id=42, recommendation_id=26))
+
+        view = app.VoteView(self.sessions, cycle.id, deadline, options, is_runoff=True)
+        select_item = view.children[0]
+        self.assertEqual(select_item.max_values, 1)
+        select_item._values = ["1"]
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=42), message=None,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        with patch.object(app, "has_voter_role", return_value=True):
+            await select_item.callback(interaction)
+        async with self.sessions() as session:
+            votes = list((await session.scalars(select(Vote).where(
+                Vote.cycle_id == cycle.id, Vote.user_id == 42))).all())
+        self.assertEqual([vote.recommendation_id for vote in votes], [1])
+
+    async def test_configured_admin_role_grants_access(self):
+        import restaurant_bot.bot as app
+
+        class FakeMember:
+            def __init__(self, administrator=False, roles=()):
+                self.guild_permissions = SimpleNamespace(administrator=administrator)
+                self.roles = [SimpleNamespace(id=role) for role in roles]
+
+        with patch.object(app.discord, "Member", FakeMember), patch.dict("os.environ", {"ADMIN_ROLE_ID": "123"}):
+            self.assertTrue(app.has_admin_access(FakeMember(roles=[123])))
+            self.assertTrue(app.has_admin_access(FakeMember(administrator=True)))
+            self.assertFalse(app.has_admin_access(FakeMember(roles=[456])))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ The bot needs the `bot` and `applications.commands` OAuth scopes plus View Chann
 
 - `DISCORD_TOKEN`: bot token.
 - `VOTER_ROLE_ID`: the role allowed to recommend, vote, and rate. It is deliberately blank in the example.
+- `ADMIN_ROLE_ID`: optional role whose members can use every admin command. Discord members with Administrator permission retain access.
 - `ANNOUNCEMENT_CHANNEL_ID`: channel for the first automatic Monday post. Later weeks can reuse the most recently stored channel.
 - `BOT_TIMEZONE` and `MONDAY_HOUR`: local weekly opening time.
 - `EVENT_DAY`, `EVENT_HOUR`, `EVENT_MINUTE`, and `EVENT_LOCATION`: scheduled-event defaults. Monday is day `0`; Friday is day `4`. For example, `EVENT_HOUR=18` and `EVENT_MINUTE=30` means 6:30 PM.
@@ -67,7 +68,7 @@ docker compose down
 1. On Monday, a 24-hour recommendation window opens and pings the configured role.
 2. Eligible users use `/recommend restaurant`; each may keep up to two active entries. `/remove` opens a private selection menu.
 3. The bot opens a 36-hour multi-select vote containing the persistent recommendation pool. Its attached embed shows a live per-restaurant vote tally and refreshes after every ballot (25 restaurants per page). When the ballot closes, its controls are removed but the message remains as a read-only final tally.
-4. The winner is announced, an external Discord event is created, and the winning recommendation waits for Friday. A tie opens a fresh one-hour runoff containing only the tied leaders. If a runoff remains tied between two restaurants, the bot chooses the winner by coin flip; larger ties continue to another one-hour runoff.
+4. The winner is announced, an external Discord event is created, and the winning recommendation waits for Friday. A tie opens a fresh one-hour runoff containing only the tied leaders. Each voter may select exactly one runoff restaurant, and submitting again replaces that choice across the whole ballot. If a runoff remains tied between two restaurants, the bot chooses the winner by coin flip; larger ties continue to another one-hour runoff.
 5. An administrator runs `/rate` on or after Friday. The role receives a 1–10 selector for 24 hours.
 6. The bot averages and announces the score and nominator, stores the result, and removes only the winning restaurant. All other recommendations carry into the next week.
 
