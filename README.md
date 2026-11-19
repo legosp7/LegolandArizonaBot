@@ -92,6 +92,7 @@ Automatic Monday openings also claim a unique server/week record before posting,
 - `/skip` — stop the current weekly cycle (administrator).
 - `/end-process` — immediately end the current phase: recommendations advance to voting, voting selects its winner, and rating calculates its result (administrator).
 - `/admin-remove user restaurant` — remove a restaurant from a specified user's active list; an active voting message and tally are refreshed automatically (administrator).
+- `/admin-remove-rated user restaurant` — remove the most recently recorded matching restaurant from a user's scored history; duplicate results remain and can be removed one at a time (administrator or configured admin role).
 - `/add user restaurant score` — store a manual historical score (administrator).
 - `/forceadd restaurant user` — add a restaurant to the voting pool for a user without applying the per-user or pool-size limits (administrator).
 - `/force-open phase [minutes] [restaurant]` — immediately open recommendations, voting, or rating for debugging. Test periods default to five minutes; forced rating uses the oldest queued restaurant unless one is named (administrator).

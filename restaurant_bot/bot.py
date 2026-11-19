@@ -984,6 +984,46 @@ async def admin_remove(interaction: discord.Interaction, user: discord.Member, r
     await interaction.followup.send(f"Removed **{removed_name}** from **{user.display_name}**'s active recommendations.", ephemeral=True)
 
 
+@bot.tree.command(name="admin-remove-rated", description="Remove one scored restaurant result from a user's history")
+@app_commands.describe(user="User whose scored result should be removed", restaurant="Exact restaurant name to remove")
+async def admin_remove_rated(interaction: discord.Interaction, user: discord.Member, restaurant: app_commands.Range[str, 1, 200]) -> None:
+    if not await require_admin_access(interaction):
+        return
+    if not interaction.guild_id:
+        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+        return
+    restaurant_name = " ".join(restaurant.strip().split())
+    await interaction.response.defer(ephemeral=True)
+    async with bot.sessions.begin() as session:
+        result = await session.scalar(
+            select(RestaurantResult)
+            .where(
+                RestaurantResult.guild_id == interaction.guild_id,
+                RestaurantResult.recommender_id == user.id,
+                func.lower(RestaurantResult.restaurant_name) == restaurant_name.casefold(),
+            )
+            .order_by(RestaurantResult.visited_at.desc(), RestaurantResult.id.desc())
+            .limit(1)
+        )
+        if result:
+            removed_name = result.restaurant_name
+            removed_score = result.average_score
+            await session.delete(result)
+        else:
+            removed_name = None
+            removed_score = None
+    if removed_name is None:
+        await interaction.followup.send(
+            f"No scored **{restaurant_name}** result was found for **{user.display_name}**.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"Removed one **{removed_name}** result ({removed_score:.2f}/10) from **{user.display_name}**'s rated restaurant history.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="force-clear", description="Permanently clear all bot data (administrator only)")
 @app_commands.describe(confirm="Type CLEAR exactly to confirm the permanent reset")
 async def force_clear(interaction: discord.Interaction, confirm: str) -> None:

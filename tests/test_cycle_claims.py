@@ -10,7 +10,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from restaurant_bot.database import (
-    ACTIVE_CYCLE_STATUSES, Cycle, Recommendation, User, Vote, WeeklyCycleClaim,
+    ACTIVE_CYCLE_STATUSES, Cycle, Recommendation, RestaurantResult, User, Vote, WeeklyCycleClaim,
     claim_cycle, create_session_factory, create_tables,
 )
 
@@ -159,6 +159,36 @@ class CycleClaimsTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.has_admin_access(FakeMember(roles=[123])))
             self.assertTrue(app.has_admin_access(FakeMember(administrator=True)))
             self.assertFalse(app.has_admin_access(FakeMember(roles=[456])))
+
+    async def test_admin_remove_rated_deletes_only_newest_duplicate(self):
+        import restaurant_bot.bot as app
+
+        older = self.monday - timedelta(days=7)
+        async with self.sessions.begin() as session:
+            session.add(User(id=77, display_name="Reviewer"))
+            session.add_all([
+                RestaurantResult(guild_id=1, restaurant_name="Pizza Place", recommender_id=77,
+                                 average_score=7.0, rating_count=3, visited_at=older, manual=False),
+                RestaurantResult(guild_id=1, restaurant_name="Pizza Place", recommender_id=77,
+                                 average_score=9.0, rating_count=4, visited_at=self.monday, manual=False),
+            ])
+        interaction = SimpleNamespace(
+            guild_id=1,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        member = SimpleNamespace(id=77, display_name="Reviewer")
+        with patch.object(app.bot, "sessions", self.sessions), patch.object(
+            app, "require_admin_access", AsyncMock(return_value=True)
+        ):
+            await app.admin_remove_rated.callback(interaction, member, "pizza place")
+        async with self.sessions() as session:
+            remaining = list((await session.scalars(select(RestaurantResult).where(
+                RestaurantResult.guild_id == 1,
+                RestaurantResult.recommender_id == 77,
+            ))).all())
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].average_score, 7.0)
 
 
 if __name__ == "__main__":
